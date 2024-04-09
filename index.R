@@ -1,310 +1,207 @@
-#////////////////////////////////////////////////////////////
-# Code to run models and create figures for Arushi UT Poster
-# Emily Javan - 2024-03-18 - ATX
-#////////////////////////////////////////////////////////////
 
-# Source functions and load need libraries
-source("CODE/0117_algorithm_hospfind.R")
+########################################################################
+# Code to run functions for comparing model performance
+# Models tested are Random Forest and Multinomial Logistic Regression
+# Currently run only for Austin, TX hospitals 
+########################################################################
 
-#///////////////////////////////////
-#### Get files for all quarters ####
-#///////////////////////////////////
-pudf_folder_path = "INPUT_DATA/Primary_Respiratory_Austin/"
-pudf_file_list = list.files(pudf_folder_path)
+# Step 0: Read the CSV file into a data frame
+# we'll double check how this data file was made from originals
+INPUT_DATA = read_csv("austin_sample_data.csv") 
 
-# 2015Q4 missing a lot of the age group for patients so need to check later
-# 2015Q3 and some of Q4 use ICD-9 codes so data may be incomplete
-all_quarter_df = data.frame()
-for(i in 1:length(pudf_file_list)){
-  pudf_file = read_csv(paste0(pudf_folder_path, pudf_file_list[i])) # open file
+# Step 1: Data Preparation
+# Your function should take in the clean data to apply algorithm to any set of features
+sub_df <- INPUT_DATA %>%
+  select(THCIC_ID, RACE, ZCTA_SVI, drive_time, SPEC_UNIT_1, PAT_AGE_ORDINAL, ETHNICITY) %>%
+  mutate(THCIC_ID = as.factor(THCIC_ID), RACE = as.factor(RACE))
 
-  sub_pudf = pudf_file %>% # subset file to relevant features for model or counting summary
-    drop_na() %>%
-    mutate(DISEASE = case_when( PRINC_DIAG_CODE_SUB=="J09" ~ "FLU",
-                                PRINC_DIAG_CODE_SUB=="J10" ~ "FLU",
-                                PRINC_DIAG_CODE_SUB=="J11" ~ "FLU",
-                                PRINC_DIAG_CODE_SUB=="J12" ~ "ILI",
-                                PRINC_DIAG_CODE    =="U071"~ "COVID",
-                                .default = "REMOVE" ) ) %>%
-    filter(!(DISEASE=="REMOVE")) %>% # Extra check to ensure only getting patients admitted to hosp bc of COVID/FLU/ILI
-    dplyr::select(PROVIDER_NAME, THCIC_ID, # the hospital IDs
-           ZCTA_SVI, drive_time, # only continuous variables in the data
-           DISCHARGE, TYPE_OF_ADMISSION, FIRST_PAYMENT_SRC, # Categorical or ordered features
-           DISEASE, PRINC_DIAG_CODE, PRINC_DIAG_CODE_SUB, any_of(c("J09", "J10", "J11", "J12", "U071")),
-           RACE, SPEC_UNIT_1, PAT_AGE_ORDINAL, ETHNICITY) %>% # J09-J11=FLU, J12=ILI, and U071=COVID ICD-10 codes
-    mutate(across(DISCHARGE:ETHNICITY, as.factor))
-    
-  all_quarter_df = bind_rows(all_quarter_df, sub_pudf) # bind all the files into 1 big file
-} # end for loop over the Austin respiratory pudf files
+# Step 2: Run models Random Forest and Multi-nomial regression for hospitals with at least 10% of data
+# num_folds not define optimal number will be chosen for 80/20 split of data
+# if seed not set then will be random
+result <- perform_cross_validation(dataset=sub_df, seed=123) # num_folds=10
+
+# Step 3: Plot results
+# adding the location and labels for our null model performance
+model_compare_acc = read_csv("OUTPUT_DATA/model_compare_accuries_2024-01-22.csv") %>%
+  mutate(line_label = ifelse(fold==max(fold), paste0(model, " null model"), NA),
+         fold_nudge = ifelse(fold==max(fold), (fold-0.2), NA),
+         y_location = ifelse(fold==max(fold), AccuracyNull, NA) )
+
+acc_comp_plot = ggplot(model_compare_acc, aes(x=fold, group=model, color=model))+ # notice how group/color are in the aes
+  # plot accuracy per fold and error bars
+  geom_point(aes(y=Accuracy))+
+  geom_errorbar(aes(ymin=AccuracyLower,ymax=AccuracyUpper), width=0.2, alpha=0.6)+
+  # plot dashed line of how well the null/random model would do
+  geom_line(aes(y=AccuracyNull), linetype="dashed")+
+  # rename the x-axis to be more informative
+  labs(x="Cross Validation Folds")+
+  # add labels to end of line for our null accuracy
+  geom_label(aes(x=fold_nudge, y=y_location, label=line_label), show.legend=F)+
+  # change color scheme, this onw is okay but the default is easier to see
+  # comment this out or try some other scales
+  ghibli::scale_colour_ghibli_d("MarnieMedium2", direction = -1)+
+  # make background white
+  theme_bw()
+# save your plot with a high resolution (1200), but let computer decide on the size
+ggsave("FIGURES/model_accuracy_compare.png", acc_comp_plot, dpi=1200) 
 
 
-#### Count by Hosp ####
-# Null model would always pick largest hosp - 26.5% correct
-#  => our models have to signficantly outperform this
-pat_per_hosp_df = as.data.frame(table(all_quarter_df$THCIC_ID, all_quarter_df$PROVIDER_NAME)) %>%
-  rename(THCIC_ID = Var1, TOTAL_PAT = Freq) %>%
-  filter(TOTAL_PAT > 100) %>% # leaves 6 hospitals with sufficient data for training
-  mutate(TOTAL_PAT_SUM = sum(TOTAL_PAT),
-         HOSP_FREQ = TOTAL_PAT/TOTAL_PAT_SUM)
+# I'll leave it to you to make a plot for the classes, usually F1 score is helpful
+# color scales will make more sense when you have more classes to visualize
+# Function to plot F1 scores for each class
+model_class_compare = read_csv("OUTPUT_DATA/model_class_compare_2024-01-22.csv")  %>% 
+  mutate(THCIC_ID = as.factor(THCIC_ID))
 
-reduced_hosp_df = all_quarter_df %>%             # 5,892 total hospitalizations
-  filter(THCIC_ID %in% pat_per_hosp_df$THCIC_ID) %>% # 5,709
-  separate(DISCHARGE, into = c("YEAR", "QUARTER"), sep = "Q", remove = F ) %>%
-  mutate(YEAR = as.numeric(YEAR),
-         QUARTER = as.numeric(QUARTER)) %>%
-  filter(!(TYPE_OF_ADMISSION=="9")) %>% # remove invalid hospital admissions
-  filter(SPEC_UNIT_1 %in% c("A", "I", "P")) %>% # A=acute, I=intensive, P=pediatric # 5,678
-  droplevels() %>%
-  mutate(THCIC_ID = as.factor(THCIC_ID)) # must be factor
+#Get the mean of the train and test data for the class size 
+class_size <- data.frame()
+for(i in 1:5){
+  temp_train <- result[[2]][[i]]
+  temp_test <- result[[3]][[i]]
+  df <- data.frame(fold = i, table(temp_train$THCIC_ID), table(temp_test$THCIC_ID)) %>% 
+    select(-Var1.1)
+  names(df) <- c("fold", "class", "train", "test") 
+  class_size <- rbind(class_size, df)
+}
 
-#/////////////////////////////////////
-#### Get count of hosp by quarter ####
-#/////////////////////////////////////
-# 2015Q4 - 2019Q3 is pre-pandemic only flu/ili codes
-# 2019Q4 - 2022Q4 likely covid spread, however some patient may not have been diagnosed as covid early on just ili
-# => we'll ignore the ICD-10 codes within the model for this reason
-count_quarter = reduced_hosp_df %>%
-  group_by(DISCHARGE) %>%
-  summarise(total_hosp = n(),
-            mean_drivetime     = mean(drive_time),
-            median_drivetime   = median(drive_time),
-            lower_ci_drivetime = confint(lm(drive_time ~ 1), level=0.95)[1],
-            upper_ci_drivetime = confint(lm(drive_time ~ 1), level=0.95)[2]) %>%
-  mutate(lower_ci_drivetime = ifelse(lower_ci_drivetime < 0, 0, lower_ci_drivetime)) %>%
+class_size_mean <- class_size %>% 
+  group_by(class) %>%
+  summarize(train_size_mean = mean(train), test_size_mean = mean(test)) %>% 
   ungroup() %>%
-  mutate(DISEASE = "TOTAL HOSP")
-count_disease_quarter = reduced_hosp_df %>%
-  group_by(DISCHARGE, DISEASE) %>%
-  summarise(total_hosp = n(),
-            mean_drivetime     = mean(drive_time),
-            median_drivetime   = median(drive_time),
-            lower_ci_drivetime = confint(lm(drive_time ~ 1), level=0.95)[1],
-            upper_ci_drivetime = confint(lm(drive_time ~ 1), level=0.95)[2]) %>%
-  mutate(lower_ci_drivetime = ifelse(lower_ci_drivetime < 0, 0, lower_ci_drivetime)) %>%
-  ungroup() %>%
-  bind_rows(count_quarter)
+  rename(THCIC_ID = class)
 
-#//////////////////////////
-#### Plot disease hosp ####
-#//////////////////////////
-# Plot by disease and total hospitalizations through time just as visual of pandemic impact on hospitals
-cdq_plot = ggplot(count_disease_quarter, 
-                  aes(x=DISCHARGE, y=total_hosp, group=DISEASE, color=DISEASE, shape=DISEASE))+
-  geom_line(alpha=0.5, linewidth=2)+
-  geom_point(size=5)+
-  scale_x_discrete(guide = guide_axis(angle = 45)) +
-  labs(y="Total Austin Respiratory Hospitalizations", x="Year-Quarter of Patient Discharge")+
-  theme_bw(base_size = 18)
-ggsave(filename="FIGURES/Arushi_Poster/count_disease_quarter_plot.png", plot=cdq_plot, bg="white", 
-       width=11, height=7.5, units="in", dpi=1200)
-
-#////////////////
-#### Example ####
-#////////////////
-# Heat map of drive time as an example visualization to get a sense of a feature through time
-browns = c("#ede5cf","#e0c2a2","#d39c83","#c1766f","#a65461","#813753","#541f3f")
-dt_heatmap = ggplot(count_disease_quarter %>% filter((DISEASE=="TOTAL HOSP")), 
-       aes(x=DISEASE, y=DISCHARGE, fill=mean_drivetime))+
-  geom_tile()+
-  scale_fill_gradientn(colours=browns) +
-  labs(x="Mean Drive Time Austin Hospitalizations", y="Year-Quarter of Patient Discharge", fill="")+
-  theme_bw(base_size = 20)+
-  theme(legend.position="bottom",
-        axis.text.x=element_blank(),
-        axis.ticks.x=element_blank(),
-        panel.background=element_blank(),
-        panel.grid.minor=element_blank(),
-        plot.background=element_blank())
-ggsave(filename="FIGURES/Arushi_Poster/drive_time_heatmap.png", plot=dt_heatmap, bg="white", 
-       width=7.5, height=9, units="in", dpi=1200)
-
-#///////////////////
-#### Run Models ####
-#///////////////////
-# Runs multi-nomial logistic regression and random forest
-
-# Model formula run inside function
-# THCIC_ID ~ RACE + ZCTA_SVI + drive_time + SPEC_UNIT_1 + ETHNICITY + PAT_AGE_ORDINAL
-pre_pandemic_df = reduced_hosp_df %>%  
-  filter(YEAR <= 2019) %>%
-  filter(!(YEAR==2019 & QUARTER==4)) %>% # 1153 total hospitalizations
-  select(THCIC_ID, ZCTA_SVI, drive_time, RACE, ETHNICITY,  
-         PAT_AGE_ORDINAL, SPEC_UNIT_1) # TYPE_OF_ADMISSION made no improvement in model
-pandemic_df = reduced_hosp_df %>%
-  filter((YEAR==2019 & QUARTER==4) | (YEAR>=2020)) %>% # 4556 total hospitalizations
-  select(THCIC_ID, ZCTA_SVI, drive_time, RACE, ETHNICITY,  
-         PAT_AGE_ORDINAL, SPEC_UNIT_1)
-all_data_df = bind_rows(pre_pandemic_df, pandemic_df)
-
-# Did 5 folds => 5-fold cross validation
-nfolds=5
-pre_pand_result = perform_cross_validation(dataset=pre_pandemic_df, 
-                                           sub_folder="PRE-PANDEMIC/", num_folds=nfolds) # seed=123, 
-pandemic_result = perform_cross_validation(dataset=pandemic_df,     
-                                           sub_folder="PANDEMIC/",     num_folds=nfolds) # seed=123, 
-all_data_result = perform_cross_validation(dataset=all_data_df,     
-                                           sub_folder="ALL_DATA/",     num_folds=nfolds) # seed=123, 
-
-#/////////////////////////////////////
-#### Aggregate Confusion Matrices ####
-#/////////////////////////////////////
-# Loop over all the confusion matrices and bind rows together
-pre_confusion = pan_confusion = all_confusion = data.frame()
-for(i in 1:nfolds){
-  temp_pre_confusion = data.frame(pre_pand_result$RF_ConfusionMatrix[[i]]$table) %>% mutate(MODEL = "Random Forest") %>%
-    bind_rows(data.frame(pre_pand_result$Multinom_ConfusionMatrix[[i]]$table)    %>% mutate(MODEL = "MultiNom Regression")) %>%
-    mutate(THCIC_ID = Prediction,
-           TIME_PERIOD = "PRE",
-           FOLD=i)
-  temp_pan_confusion = data.frame(pandemic_result$RF_ConfusionMatrix[[i]]$table) %>% mutate(MODEL = "Random Forest") %>%
-    bind_rows(data.frame(pandemic_result$Multinom_ConfusionMatrix[[i]]$table)    %>% mutate(MODEL = "MultiNom Regression")) %>%
-    mutate(THCIC_ID = Prediction,
-           TIME_PERIOD = "PAND",
-           FOLD=i)
-  temp_all_confusion = data.frame(all_data_result$RF_ConfusionMatrix[[i]]$table) %>% mutate(MODEL = "Random Forest") %>%
-    bind_rows(data.frame(all_data_result$Multinom_ConfusionMatrix[[i]]$table)    %>% mutate(MODEL = "MultiNom Regression")) %>%
-    mutate(THCIC_ID = Prediction,
-           TIME_PERIOD = "ALL",
-           FOLD=i)
-  
-  pre_confusion = bind_rows(pre_confusion, temp_pre_confusion)
-  pan_confusion = bind_rows(pan_confusion, temp_pan_confusion)
-  all_confusion = bind_rows(all_confusion, temp_all_confusion)
-} # end loop over confusion matrices
-
-cm_df = bind_rows(pre_confusion, pan_confusion, all_confusion) %>%
-  group_by(FOLD, MODEL, TIME_PERIOD, Reference) %>%
-  mutate(TOTAL_PAT = sum(Freq)) %>%
-  ungroup() %>%
-  mutate(PERCENT_PREDICT = Freq/TOTAL_PAT) %>%
-  mutate(DIAG = ifelse(Prediction==Reference, T, NA))
-
-cm_df_mean = cm_df %>%
-  group_by(MODEL, TIME_PERIOD, Reference, Prediction, DIAG) %>%
-  summarise(PERCENT_PREDICT_mean = round(mean(PERCENT_PREDICT), 2) ) %>%
-  ungroup() %>%
-  mutate(THCIC_ID=Reference,
-         Reference = case_when( Reference == "35000"  ~ "A",
-                                Reference == "497000" ~ "B",
-                                Reference == "602000" ~ "C",
-                                Reference == "797600" ~ "D",
-                                Reference == "829900" ~ "E",
-                                Reference == "852000" ~ "F",
-                                .default = "REMOVE" ),
-         Prediction = case_when(Prediction == "35000"  ~ "StDavids - A",
-                                Prediction == "497000" ~ "AscSeton - B",
-                                Prediction == "602000" ~ "StDavidsS - C",
-                                Prediction == "797600" ~ "AscSetonNW - D",
-                                Prediction == "829900" ~ "NorthAustin - E",
-                                Prediction == "852000" ~ "DellChildren - F",
-                                .default = "REMOVE" ))
-
-#//////////////////////////////
-#### Plot Confusion Matrix ####
-#//////////////////////////////
-order=c("PRE", "PAND", "ALL") #  Flu/ILI  Flu/ILI/COVID-19 
-time_label = c(`PRE`="Pre-Pandemic\n2015Q4-2019Q3", `PAND`="Pandemic\n2019Q4-2022Q4", `ALL`="All Admits\n2015Q4-2022Q4")
-army_rose = rev(c("#798234","#a3ad62","#d0d3a2","#fdfbe4","#f0c6c3","#df91a3","#d46780"))
-prediction_order = rev(c("StDavids - A",   "AscSeton - B",    "StDavidsS - C", 
-                     "AscSetonNW - D", "NorthAustin - E", "DellChildren - F"))
-
-mean_cm_plot = ggplot(cm_df_mean, aes(x=Reference, y=factor(Prediction, level=prediction_order),
-                                      fill=PERCENT_PREDICT_mean)) +
-  labs(x="Correct Hospital", y="Predicted Hospital")+
-  geom_tile() + theme_bw(base_size=20) + coord_equal() +
-    geom_tile(data = cm_df_mean[!is.na(cm_df_mean$DIAG), ], aes(color = DIAG), linewidth = 1) + # add black box around diagonal
-  scale_color_manual(guide = "none", values = c(`TRUE` = "black"))+
-  facet_grid( MODEL ~ factor(TIME_PERIOD, order),
-              labeller = labeller( .cols = as_labeller(time_label) )) +
-  #scale_fill_distiller(palette="PiYG", direction=1) +
-  scale_fill_gradientn(colours = army_rose)+
-  guides(fill="none") + # removing legend for `fill`
-  geom_text(aes(label=PERCENT_PREDICT_mean), color="black") # + # printing values in tile
-  #theme(axis.text.x = element_text(angle = 75, vjust = 0.6)) # , hjust=1
-ggsave(filename="FIGURES/Arushi_Poster/mean_confusion_matrix.png", plot=mean_cm_plot, bg="white", 
-       width=11, height=9, units="in", dpi=1200)
-
-#///////////////////////////////////////////////
-# RF Permute of best performing Test/Train Split
-#///////////////////////////////////////////////
-
-# best performing (highest accuracy of all folds/times)
-# The output across folds was really similar and stable
-plotTrace(all_data_result$RF_Model[[2]])
-
-# ggsave wont't save it so doing screen shot for now
-# will probably need to take data and make our own custom ggplot
-# maybe look at function code to get each plot and do cowplot::plot_grid
-plotImportance(all_data_result$RF_Model[[2]])
-
-#///////////////////////////////////////
-#### Multinomial regression summary ####
-#///////////////////////////////////////
-# Doesn't show p-values like we'd like need to find better summary
-summary(all_data_result$Multinom_Model[[2]])
+full_df = model_class_compare %>% 
+  left_join(class_size_mean, by="THCIC_ID")
 
 
 
-#/////////////////////////////
-#### Train and Test Count ####
-#/////////////////////////////
-all_data_train = data.frame(table(all_data_result$Train_Data[[1]]$THCIC_ID)) %>% 
-  rename(THCIC_ID = Var1, ALL_DATA_TRAIN = Freq)
-all_data_test = data.frame(table(all_data_result$Test_Data[[1]]$THCIC_ID)) %>% 
-  rename(THCIC_ID = Var1, ALL_DATA_TEST = Freq)
-prepand_data_train = data.frame(table(pre_pand_result$Train_Data[[1]]$THCIC_ID)) %>% 
-  rename(THCIC_ID = Var1, PRE_PAND_TRAIN = Freq)
-prepand_data_test = data.frame(table(pre_pand_result$Test_Data[[1]]$THCIC_ID)) %>% 
-  rename(THCIC_ID = Var1, PRE_PAND_TEST = Freq)
-pand_data_train = data.frame(table(pandemic_result$Train_Data[[1]]$THCIC_ID)) %>% 
-  rename(THCIC_ID = Var1, PANDEMIC_TRAIN = Freq)
-pand_data_test = data.frame(table(pandemic_result$Test_Data[[1]]$THCIC_ID)) %>% 
-  rename(THCIC_ID = Var1, PANDEMIC_TEST = Freq)
-
-temp_hosp_df = pat_per_hosp_df %>%
-  filter(!(Var2=="Seton Medical Center"))
-hosp_name_df$TOTAL_PAT[which(hosp_name_df$THCIC_ID=="497000")] = (127+958)
-hosp_name_df = temp_hosp_df %>%
-  mutate(HOSP_FREQ = TOTAL_PAT/TOTAL_PAT_SUM) %>%
-  rename(HOSP_NAME=Var2) %>%
-  left_join(all_data_train, by="THCIC_ID") %>%
-  left_join(all_data_test, by="THCIC_ID") %>%
-  left_join(prepand_data_train, by="THCIC_ID") %>%
-  left_join(prepand_data_test, by="THCIC_ID") %>%
-  left_join(pand_data_train, by="THCIC_ID") %>%
-  left_join(pand_data_test, by="THCIC_ID")
-  
+model_f1_compare <- ggplot(full_df, 
+                                  aes(x=F1, y=fold, group=model, color=model)) + 
+  geom_line(alpha=0.5)+
+  geom_point()+
+  facet_wrap(~THCIC_ID, ncol = 1)+
+  theme_bw() 
 
 
+#Create the boxplot for the classes based on Precision
+model_percision_compare <- ggplot(full_df, 
+                           aes(x=THCIC_ID, y=Precision, group=interaction(model, THCIC_ID), color=model)) + 
+  geom_boxplot() + 
+  theme_bw() 
+
+# Create a summary dataset with mean precision for each model and class
+summary_data <- full_df %>%
+  group_by(model, THCIC_ID) %>%
+  summarise(mean_precision = mean(Precision), .groups = 'drop')
+
+# Create the detailed ggplot
+model_precision_compare <- ggplot(full_df, 
+                                  aes(x = factor(THCIC_ID), y = Precision, fill = model)) + 
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) + 
+  geom_point(data = summary_data, aes(x = factor(THCIC_ID), y = mean_precision), 
+             color = "black", size = 3, shape = 17) +
+  stat_summary(data = summary_data, fun = mean, geom = "point", 
+               aes(x = factor(THCIC_ID), y = mean_precision, group = model), 
+               size = 3, color = "black", shape = 18) +
+  theme_minimal() +
+  labs(title = "Comparison of Precision by Class and Model",
+       x = "THCIC_ID",
+       y = "Precision",
+       fill = "Model") +
+  theme(legend.position = "bottom")
+
+#facet wrapped precision boxplot 
+model_percision_compare <- ggplot(full_df, 
+        aes(x=THCIC_ID, y=Precision, group=interaction(model, THCIC_ID), color=model)) + 
+        geom_line(alpha=0.5)+
+        geom_point()+
+        facet_wrap(~THCIC_ID, ncol = 1)+
+        theme_bw() 
+
+# Create a summary dataset with mean balanced accuracy for each model and class
+summary_data_accuracy <- full_df %>%
+  group_by(model, THCIC_ID) %>%
+  summarise(mean_accuracy = mean(Balanced.Accuracy), .groups = 'drop')
+
+# Create the detailed ggplot for accuracy comparison
+model_accuracy_compare <- ggplot(full_df, 
+                                 aes(x = factor(THCIC_ID), y = Balanced.Accuracy, fill = model)) + 
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) + 
+  geom_point(data = summary_data_accuracy, aes(x = factor(THCIC_ID), y = mean_accuracy), 
+             color = "black", size = 3, shape = 17) +
+  annotate("text", x = '829900' , y = 0.7, color = "black", label = "triangle = mean accuracy" ) + 
+  stat_summary(data = summary_data_accuracy, fun = mean, geom = "point", 
+               aes(x = factor(THCIC_ID), y = mean_accuracy, group = model), 
+               size = 3, color = "black", shape = 18) +
+  theme_minimal() +
+  labs(title = "Comparison of Balanced Accuracy by Class and Model",
+       x = "THCIC_ID",
+       y = "Balanced Accuracy",
+       fill = "Model") +
+  theme(legend.position = "bottom")
+
+#Create the boxplot for the classes based on Accuracy
+model_accuracy_compare <- ggplot(full_df, 
+                                  aes(x=THCIC_ID, y=Balanced.Accuracy, group=interaction(model, THCIC_ID), color=model)) + 
+  geom_boxplot() + 
+  geom_label(aes(label = F1), position = position_dodge(width = 1.0), vjust = -0.5, size = 2) + 
+  theme_bw() 
+
+#facet wrapped percision boxplot 
+model_percision_compare <- ggplot(full_df, 
+                                  aes(x=THCIC_ID, y=Precision, group=interaction(model, THCIC_ID), color=model)) + 
+  geom_line(alpha=0.5)+
+  geom_point()+
+  #geom_label(aes(label = F1), position = position_dodge(width = 1.0), vjust = -0.5, size = 2) +
+  facet_wrap(~THCIC_ID, ncol = 1)+
+  theme_bw() 
+
+#look at all of the SVIs 
+ggplot(sub_df, aes(x = ZCTA_SVI, group=THCIC_ID, fill= THCIC_ID)) +
+  geom_boxplot(width = 0.2) +
+  labs(x = "ZCTA_SVI") +
+  theme_minimal()
 
 
-#///////////////////////////////////////////////////////////////////////
-#### Test BRF performance without the specialty unit they reside in ####
-#///////////////////////////////////////////////////////////////////////
-# SPEC_UNIT_1 could be treated as risk group (high/low = icu/acute)
-# All other features about the patient or ZIP code
-#  could be estimated at census block group level from ACS
-# Work towards proportion of ILI hospitalized in each CBG that will go to
-#  which hospital
+X = '829900'
 
-train_data = all_data_result$Train_Data[[2]]
-test_data = all_data_result$Test_Data[[2]]
+#compare each hospital to each other 
+hospital_data_compare <- sub_df %>%
+  mutate(is_hospital_x = ifelse(THCIC_ID == X, 1, 0),
+         is_hospital_x  = as.factor(is_hospital_x))
+table(hospital_data_compare$is_hospital_x)
 
+ggplot(hospital_data_compare, aes(x = ZCTA_SVI, fill = is_hospital_x)) +
+  geom_histogram(binwidth = 0.01, alpha = 0.5, position = "identity") +
+  labs(x = "ZCTA_SVI", y = "Frequency") +
+  theme_minimal()
 
+# Box plot
+ggplot(hospital_data_compare, aes(x = is_hospital_x, y = ZCTA_SVI, fill =is_hospital_x)) +
+  geom_boxplot() +
+  labs(x = "THCIC_ID", y = "ZCTA_SVI") +
+  theme_minimal()
 
-sampsize = balancedSampsize(train_data$THCIC_ID)
-rfPermute_model = rfPermute(THCIC_ID ~ RACE + ZCTA_SVI + drive_time + ETHNICITY + PAT_AGE_ORDINAL, 
-                            data = train_data, ntree = 500, num.rep = 1000, num.cores = 6,
-                            replace = FALSE, sampsize = sampsize)
+# Violin plot
+ggplot(hospital_data_compare, aes(x = is_hospital_x, y = ZCTA_SVI, fill = is_hospital_x)) +
+  geom_violin() +
+  labs(x = "THCIC_ID", y = "ZCTA_SVI") +
+  theme_minimal()
 
-rfPermute_performance = predict(rfPermute_model, newdata = test_data)
+# Density plot
+ggplot(hospital_data_compare, aes(x = ZCTA_SVI, fill = is_hospital_x)) +
+  geom_density(alpha = 0.5) +
+  labs(x = "ZCTA_SVI", y = "Density") +
+  theme_minimal()
 
-rf_conf_mat <- caret::confusionMatrix(as.factor(rfPermute_performance), as.factor(test_data$THCIC_ID))
+# Scatter plot with jitter
+ggplot(hospital_data_compare, aes(x = is_hospital_x, y = ZCTA_SVI, color = is_hospital_x)) +
+  geom_jitter(width = 0.2) +
+  labs(x = "THCIC_ID", y = "ZCTA_SVI") +
+  theme_minimal()
 
-
-all_data_result$RF_ConfusionMatrix[[2]]
-
-
-
-
+#see a logistic model of the hospital compare in comparison to different variables
+logistic_model <- glm(is_hospital_x ~ ZCTA_SVI,
+                      data = hospital_data_compare, 
+                      family = binomial)
+summary(logistic_model)
 
